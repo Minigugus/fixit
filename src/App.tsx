@@ -1,406 +1,328 @@
-import { Fragment, useReducer, useState } from 'react'
-import './App.css'
-import reactLogo from './assets/react.svg'
+import { Fragment, useEffect, useRef, useState } from 'react'
 import css from './fix.module.css'
-import viteLogo from '/vite.svg'
+import { FixDefinition, FixFieldType, FixSupportedVersions, useFixDefinitions } from './fixdef'
+import { DefinitionsByBeginString } from './defs/FIX42'
 
-type MsgStatus =
-  | 'new'
-  | 'header'
-  | 'body'
-  | 'complete'
-
-interface MsgBase {
-  status: MsgStatus
-  version: string | null
-  length: number
-  fields: ReadonlyMap<number, string>
-  checksum: number
-  isValid: boolean
-  left: number
-  timing: {
-    waiting: number
-    parsingStart: number
-    parsingEnd: number
-  }
+interface IncomingMsg {
+  way: 'recv'
+  content: Uint8Array
 }
 
-interface NewMsg extends MsgBase {
-  status: 'new'
-  version: null
-  length: 0
-  checksum: 0
-  isValid: false
-  left: 0
-}
-
-interface MsgWithPartialHeader extends MsgBase {
-  status: 'header'
-  version: string
-  length: 0
-  isValid: false
-  left: 0
-}
-
-interface MsgWithPartialBody extends MsgBase {
-  status: 'body'
-  version: string
-  length: number
-  isValid: false
-}
-
-interface CompleteMsg extends MsgBase {
-  status: 'complete'
-  version: string
-  length: number
-  left: 0
+interface OutgoingMsg {
+  way: 'send'
+  content: Uint8Array
 }
 
 type Msg =
-  | NewMsg
-  | MsgWithPartialHeader
-  | MsgWithPartialBody
-  | CompleteMsg
+  | IncomingMsg
+  | OutgoingMsg
 
 type ConnectionStatus =
-  | { status: 'offline', host: '', port: 0 }
-  | { status: 'disconnected', host: string, port: number, error: string | null }
-  | { status: 'connecting', host: string, port: number }
-  | { status: 'connected', host: string, port: number }
-  | { status: 'error', host: string, port: number, error: string }
+  // | { status: 'offline', host: '', port: 0 }
+  | { status: 'disconnected', host: string, port: number, senderCompId: string, targetCompId: string, error: string | null }
+  | { status: 'connecting', host: string, port: number, senderCompId: string, targetCompId: string }
+  | { status: 'connected', host: string, port: number, senderCompId: string, targetCompId: string }
+// | { status: 'error', host: string, port: number, error: string }
 
-interface State {
-  completeMsgs: Msg[]
-  nextMsg: Msg
-  connection: ConnectionStatus
-  pendingBuffers: Uint8Array[]
-  pendingLength: number
-}
-
-type Msg0 =
+type ProcessingMsg =
   | { status: 'new', pending: Uint8Array[], length: number }
   | { status: 'header', pending: Uint8Array[], length: number }
   | { status: 'body', content: Uint8Array, offset: number }
   | { status: 'complete', content: Uint8Array }
 
-interface State0 {
-  completeMsgs: Uint8Array[]
-  nextMsg: Msg0
+interface State {
+  completeMsgs: Msg[]
+  nextMsg: ProcessingMsg
   connection: ConnectionStatus
 }
 
-type Action =
-  | { action: 'connect', host: string, port: number }
-  | { action: 'disconnect', error: string | null }
-  | { action: 'recv', buffer: Uint8Array }
-
-const EMPTY_STATE: State = {
-  completeMsgs: [],
-  nextMsg: {
-    status: 'new',
-    version: null,
-    length: 0,
-    fields: new Map(),
-    checksum: 0,
-    isValid: false,
-    left: 0,
-    timing: {
-      waiting: 0,
-      parsingEnd: 0,
-      parsingStart: 0
-    }
-  },
-  connection: { status: 'offline', host: '', port: 0 },
-  pendingBuffers: [],
-  pendingLength: 0
-}
-
-const EMPTY_STATE0: State0 = {
+const EMPTY_STATE0: State = {
   completeMsgs: [],
   nextMsg: { status: 'new', pending: [], length: 0 },
-  connection: { status: 'offline', host: '', port: 0 }
+  connection: { status: 'disconnected', host: '', port: 0, senderCompId: '', targetCompId: '', error: null }
 }
 
 const DECODER = new TextDecoder()
 
-function App() {
-  const [count, setCount] = useState(0)
-  // const [state, dispatch] = useReducer((state: State, action: Action): typeof state => {
-  //   switch (action.action) {
-  //     case 'connect':
-  //       return {
-  //         ...EMPTY_STATE,
-  //         connection: { status: 'connecting', host: action.host, port: action.port }
-  //       }
-  //     case 'disconnect':
-  //       switch (state.connection.status) {
-  //         case 'connected':
-  //         case 'connecting':
-  //           return {
-  //             ...state,
-  //             connection: { status: 'disconnected', host: state.connection.host, port: state.connection.port, error: action.error }
-  //           }
-  //       }
-  //       return state
-  //     case 'recv':
-  //       {
-  //         const { buffer } = action
-  //         let {
-  //           completeMsgs, nextMsg,
-  //           pendingBuffers, pendingLength
-  //         } = state;
-  //         let separator = -1, leftFrom = 0, field;
-  //         while ((separator = buffer.indexOf(1, leftFrom)) !== -1) {
-  //           const len = separator - leftFrom
-  //           field = new Uint8Array(pendingLength + len)
-  //           field.set(buffer.subarray(leftFrom, separator), field.byteLength - len)
-  //           for (let i = 0, j = 0; i < pendingBuffers.length; i++, j += pendingBuffers[i].byteLength)
-  //             field.set(pendingBuffers[i], j)
-  //           leftFrom = separator + 1;
-  //           const pair = new TextDecoder().decode(field)
-  //           console.log('FIELD %s', pair)
-  //           let checksum = nextMsg.checksum + field.reduce((sum, v) => sum + v, 0) + 1
-  //           switch (nextMsg.status) {
-  //             case 'new': // expected 8=
-  //               nextMsg = {
-  //                 status: 'header',
-  //                 version: new TextDecoder().decode(field.subarray(2)),
-  //                 length: 0,
-  //                 fields: nextMsg.fields,
-  //                 checksum,
-  //                 isValid: false,
-  //                 left: 0,
-  //                 timing: {
-  //                   waiting: nextMsg.timing.waiting,
-  //                   parsingStart: Date.now(),
-  //                   parsingEnd: 0
-  //                 }
-  //               }
-  //               break
-  //             case 'header': // expected 9=
-  //               let length = parseInt(new TextDecoder().decode(field.subarray(2)), 10)
-  //               nextMsg = {
-  //                 status: 'body',
-  //                 version: nextMsg.version,
-  //                 length,
-  //                 fields: nextMsg.fields,
-  //                 checksum,
-  //                 isValid: false,
-  //                 left: length,
-  //                 timing: nextMsg.timing
-  //               }
-  //               break
-  //             case 'body': // any field before end of body
-  //               if (nextMsg.left <= 0) {
-  //                 checksum = nextMsg.checksum % 256;
-  //                 const isValid = parseInt(new TextDecoder().decode(field.subarray(3)), 10) === checksum
-  //                 completeMsgs = [...completeMsgs, {
-  //                   status: 'complete',
-  //                   version: nextMsg.version,
-  //                   length: nextMsg.length,
-  //                   fields: nextMsg.fields,
-  //                   checksum,
-  //                   isValid,
-  //                   left: 0,
-  //                   timing: {
-  //                     waiting: nextMsg.timing.waiting,
-  //                     parsingStart: nextMsg.timing.parsingStart,
-  //                     parsingEnd: Date.now()
-  //                   }
-  //                 }]
-  //                 nextMsg = {
-  //                   ...EMPTY_STATE.nextMsg,
-  //                   timing: {
-  //                     waiting: Date.now(),
-  //                     parsingStart: 0,
-  //                     parsingEnd: 0
-  //                   }
-  //                 }
-  //               } else {
-  //                 let { version, length, fields } = nextMsg
-  //                 const sep = pair.indexOf('=')
-  //                 if (sep !== -1)
-  //                   fields = new Map([...fields, [parseInt(pair.slice(0, sep)), pair.slice(sep + 1)]])
-  //                 nextMsg = {
-  //                   status: 'body',
-  //                   version,
-  //                   length,
-  //                   fields,
-  //                   checksum,
-  //                   isValid: false,
-  //                   left: nextMsg.left - (field.byteLength + 1),
-  //                   timing: nextMsg.timing
-  //                 }
-  //               }
-  //               break
-  //             default:
-  //               completeMsgs = [...completeMsgs, nextMsg]
-  //               nextMsg = EMPTY_STATE.nextMsg
-  //               break
-  //           }
-  //         }
-  //         if (!field) {
-  //           pendingBuffers = [...pendingBuffers, buffer]
-  //           pendingLength = pendingLength + buffer.byteLength
-  //         } else if (leftFrom < buffer.byteLength) {
-  //           pendingBuffers = [buffer.subarray(leftFrom)]
-  //           pendingLength = buffer.byteLength - leftFrom
-  //         } else {
-  //           pendingBuffers = EMPTY_STATE.pendingBuffers
-  //           pendingLength = 0
-  //         }
-  //         return {
-  //           completeMsgs,
-  //           nextMsg,
-  //           connection: state.connection,
-  //           pendingBuffers,
-  //           pendingLength
-  //         }
-  //       }
-  //   }
-  //   return state
-  // }, EMPTY_STATE)
+const connect = (
+  host: string,
+  port: number,
+  senderCompId: string,
+  targetCompId: string
+) => (state: State): typeof state => ({
+  ...state,
+  connection: {
+    status: 'connecting',
+    host,
+    port,
+    senderCompId,
+    targetCompId
+  }
+})
 
-  const [state, dispatch] = useReducer((state: State0, action: Action): typeof state => {
-    switch (action.action) {
-      case 'connect':
-        return {
-          ...EMPTY_STATE0,
-          connection: { status: 'connecting', host: action.host, port: action.port }
-        }
-      case 'disconnect':
-        switch (state.connection.status) {
-          case 'connected':
-          case 'connecting':
+const connected = () => (state: State): typeof state => ({
+  ...state,
+  connection: {
+    ...state.connection,
+    status: 'connected'
+  }
+})
+
+const disconnect = (error?: string) => (state: State): typeof state => ({
+  ...state,
+  connection: {
+    ...state.connection,
+    status: 'disconnected',
+    error: error ?? null
+  }
+})
+
+const send = (content: Uint8Array) => (state: State): typeof state => ({
+  ...state,
+  completeMsgs: [...state.completeMsgs, { way: 'send', content }]
+})
+
+const recv = (buf: Uint8Array) => (state: State): typeof state => {
+  let buffer = buf
+  let { completeMsgs, nextMsg } = state
+  mainLoop: while (true) {
+    switch (nextMsg.status) {
+      case 'new':
+        {
+          let sep = buffer.indexOf(1)
+          if (sep === -1)
             return {
               ...state,
-              connection: { status: 'disconnected', host: state.connection.host, port: state.connection.port, error: action.error }
+              completeMsgs,
+              nextMsg: {
+                status: 'new',
+                pending: buffer.length ? [...nextMsg.pending, buffer] : nextMsg.pending,
+                length: nextMsg.length + buffer.length
+              }
             }
+          const before = buffer.subarray(0, sep + 1)
+          buffer = buffer.subarray(sep + 1)
+          nextMsg = {
+            status: 'header',
+            pending: before.length ? [...nextMsg.pending, before] : nextMsg.pending,
+            length: nextMsg.length + before.length
+          }
+          // fallthrough
         }
-        return state
-      case 'recv':
+      case 'header':
         {
-          let { buffer } = action
-          let { completeMsgs, nextMsg } = state
-          mainLoop: while (true) {
-            switch (nextMsg.status) {
-              case 'new':
-                {
-                  let sep = buffer.indexOf(1)
-                  if (sep === -1)
-                    return {
-                      ...state,
-                      completeMsgs,
-                      nextMsg: {
-                        status: 'new',
-                        pending: buffer.length ? [...nextMsg.pending, buffer] : nextMsg.pending,
-                        length: nextMsg.length + buffer.length
-                      }
-                    }
-                  const before = buffer.subarray(0, sep + 1)
-                  buffer = buffer.subarray(sep + 1)
-                  nextMsg = {
-                    status: 'header',
-                    pending: before.length ? [...nextMsg.pending, before] : nextMsg.pending,
-                    length: nextMsg.length + before.length
-                  }
-                  // fallthrough
-                }
-              case 'header':
-                {
-                  let sep = buffer.indexOf(1)
-                  if (sep === -1)
-                    return {
-                      ...state,
-                      completeMsgs,
-                      nextMsg: {
-                        status: 'header',
-                        pending: buffer.length ? [...nextMsg.pending, buffer] : nextMsg.pending,
-                        length: nextMsg.length + buffer.length
-                      }
-                    }
-                  const before = buffer.subarray(0, sep + 1)
-                  buffer = buffer.subarray(sep + 1)
-                  const queue = before.length ? [...nextMsg.pending, before] : nextMsg.pending
-                  const length = nextMsg.length + before.length
-                  for (let i = queue.length - 1, j = length; i >= 0; i--) {
-                    let b = queue[i]
-                    j -= b.length
-                    sep = b.lastIndexOf(61) // 61 means '='
-                    if (sep === -1) continue
-                    const value = new Uint8Array(length - (j + sep + 2))
-                    value.set(b.subarray(sep + 1, -1), 0)
-                    for (let k = i + 1, l = length; k < queue.length; k++)
-                      value.set(b = queue[k], l -= b.length)
-                    const len = parseInt(DECODER.decode(value), 10)
-                    if (isNaN(len))
-                      throw new Error('Invalid body length: not a number')
-                    const content = new Uint8Array(length + len + 7)
-                    for (let i = 0, j = 0; i < queue.length; j += b.length, i++)
-                      content.set(b = queue[i], j)
-                    nextMsg = {
-                      status: 'body',
-                      content,
-                      offset: length
-                    }
-                    continue mainLoop
-                  }
-                }
-                break
-              case 'body':
-                {
-                  const content = nextMsg.content
-                  const offset = Math.min(nextMsg.content.length, nextMsg.offset + buffer.length)
-                  const to = Math.min(nextMsg.content.length - nextMsg.offset, buffer.length)
-                  content.set(buffer.subarray(0, to), nextMsg.offset)
-                  if (offset < content.length)
-                    return {
-                      ...state,
-                      completeMsgs,
-                      nextMsg: {
-                        status: 'body',
-                        content,
-                        offset
-                      }
-                    }
-                  buffer = buffer.subarray(to)
-                  completeMsgs = [...completeMsgs, content]
-                  nextMsg = {
-                    status: 'new',
-                    pending: [],
-                    length: 0
-                  }
-                }
-                continue mainLoop
+          let sep = buffer.indexOf(1)
+          if (sep === -1)
+            return {
+              ...state,
+              completeMsgs,
+              nextMsg: {
+                status: 'header',
+                pending: buffer.length ? [...nextMsg.pending, buffer] : nextMsg.pending,
+                length: nextMsg.length + buffer.length
+              }
             }
-            throw new Error('Illegal state: ' + nextMsg.status)
+          const before = buffer.subarray(0, sep + 1)
+          buffer = buffer.subarray(sep + 1)
+          const queue = before.length ? [...nextMsg.pending, before] : nextMsg.pending
+          const length = nextMsg.length + before.length
+          for (let i = queue.length - 1, j = length; i >= 0; i--) {
+            let b = queue[i]
+            j -= b.length
+            sep = b.lastIndexOf(61) // 61 means '='
+            if (sep === -1) continue
+            const value = new Uint8Array(length - (j + sep + 2))
+            value.set(b.subarray(sep + 1, -1), 0)
+            for (let k = i + 1, l = length; k < queue.length; k++)
+              value.set(b = queue[k], l -= b.length)
+            const len = parseInt(DECODER.decode(value), 10)
+            if (isNaN(len))
+              throw new Error('Invalid body length: not a number')
+            const content = new Uint8Array(length + len + 7)
+            for (let i = 0, j = 0; i < queue.length; j += b.length, i++)
+              content.set(b = queue[i], j)
+            nextMsg = {
+              status: 'body',
+              content,
+              offset: length
+            }
+            continue mainLoop
           }
         }
+        break
+      case 'body':
+        {
+          const content = nextMsg.content
+          const offset = Math.min(nextMsg.content.length, nextMsg.offset + buffer.length)
+          const to = Math.min(nextMsg.content.length - nextMsg.offset, buffer.length)
+          content.set(buffer.subarray(0, to), nextMsg.offset)
+          if (offset < content.length)
+            return {
+              ...state,
+              completeMsgs,
+              nextMsg: {
+                status: 'body',
+                content,
+                offset
+              }
+            }
+          buffer = buffer.subarray(to)
+          completeMsgs = [...completeMsgs, { way: 'recv', content }]
+          nextMsg = {
+            status: 'new',
+            pending: [],
+            length: 0
+          }
+        }
+        continue mainLoop
     }
-    return state
-  }, EMPTY_STATE0)
+    throw new Error('Illegal state: ' + nextMsg.status)
+  }
+}
+
+const formatMsg = <K extends FixSupportedVersions>(
+  defs: Record<FixSupportedVersions, FixDefinition>,
+  raw: DefinitionsByBeginString & { BeginString: K, MsgType: string }
+) => {
+  const { ...content } = raw
+  const { BeginString, MsgType } = content
+  const def = defs[BeginString]
+  let msg: string[] = []
+  const msgType = def.messages.get(MsgType)
+  for (const field of def.header.entries.values()) {
+    const id = def.fieldsByName.get(field.name)?.id
+    if (typeof id !== 'number') continue
+    const v = content[field.name as keyof typeof content]
+    if (typeof v === 'undefined')
+      if (field.required)
+        throw new Error(`Missing required field ${field.name} (${id})`)
+      else
+        continue
+    delete content[field.name as keyof typeof content]
+    msg.push(`${id}=${v}\x01`)
+  }
+  if (msgType) {
+    for (const field of msgType.entries.values()) {
+      const id = def.fieldsByName.get(field.name)?.id
+      if (typeof id !== 'number') continue
+      const v = content[field.name as keyof typeof content]
+      if (typeof v === 'undefined')
+        if (field.required)
+          throw new Error(`Missing required field ${field.name} (${id})`)
+        else
+          continue
+      msg.push(`${id}=${v}\x01`)
+    }
+  } else
+    for (const [k, v] of Object.entries(content)) {
+      const id = def.fieldsByName.get(k)?.id
+      if (typeof id !== 'number') continue
+      msg.push(`${id}=${v}\x01`)
+    }
+  msg.shift()
+  msg.shift()
+  msg.unshift(`9=${msg.reduce((sum, v) => sum + v.length, 7)}\x01`)
+  msg.unshift(`8=${def.beginString}\x01`)
+  msg.push(`10=${String(msg.flatMap(v => [...v]).reduce((sum, v) => sum + v.charCodeAt(0), 0) % 256).padStart(3, '0')}\x01`)
+  return new TextEncoder().encode(msg.join(''))
+}
+
+function App() {
+  const socketRef = useRef<TCPSocket | null>(null)
+  const areDirectSocketsAvailable = typeof TCPSocket === 'function'
+  const [state, dispatch] = useState(EMPTY_STATE0)
+
+  const defs = useFixDefinitions()
+
+  console.log(defs)
+
+  useEffect(() => {
+    // if (areDirectSocketsAvailable) return
+    console.log(`${Object
+      .values(defs)
+      .map((v) => `export namespace FIX${v.major}${v.minor} {
+    export interface Header {
+      ${[...v.header.entries.values()]
+          .map(f => `${f.name}${f.required ? '' : '?'}: ${f.name === 'BeginString'
+            ? `'${v.beginString}'`
+            : v.fieldsByName.get(f.name)?.values.size
+              ? [...v.fieldsByName.get(f.name)?.values.values() || []].map(v => `'${v.enum}'`).join(' | ')
+              : (['FLOAT', 'INT', 'PRICE', 'PRICEOFFSET', 'QTY'] as FixFieldType[]).includes(v.fieldsByName.get(f.name)?.type as any)
+                ? 'number'
+                : 'string'}`)
+          .join('\n    ')}
+  }
+  
+  ${[...v.messages.values()]
+          .map(m => `  export interface ${m.name}Message extends Header {
+      MsgType: '${m.msgType}'
+      ${[...m.entries.values()]
+              .map(f => `${f.name}${f.required ? '' : '?'}: ${v.fieldsByName.get(f.name)?.values.size
+                ? [...v.fieldsByName.get(f.name)?.values.values() || []].map(v => `'${v.enum}'`).join(' | ')
+                : (['FLOAT', 'INT', 'PRICE', 'PRICEOFFSET', 'QTY'] as FixFieldType[]).includes(v.fieldsByName.get(f.name)?.type as any)
+                  ? 'number'
+                  : 'string'}`)
+              .join('\n    ')}
+    }`)
+          .join('\n\n')}
+  
+    export type Messages = ${[...v.messages.values()].map(m => `\n    | ${m.name}Message`).join('')}
+  
+  }`)
+      .join('\n\n')}
+  
+  export type DefinitionsByBeginString = ${Object.values(defs).map(d => `\n | FIX${d.major}${d.minor}.Messages`).join('')}
+  `)
+  }, [defs])
+
+  useEffect(() => {
+    const readLoop = async (socket: TCPSocket, signal: AbortSignal) => {
+      let reader;
+      try {
+        debugger
+        const { readable, writable } = await socket.opened
+        dispatch(connected())
+        const writer = writable.getWriter()
+        const logon = formatMsg(defs, {
+          BeginString: 'FIX.4.2',
+          BodyLength: 0,
+          MsgType: 'A',
+          EncryptMethod: '0',
+          HeartBtInt: 30,
+          MsgSeqNum: 0,
+          SenderCompID: 'RECV',
+          TargetCompID: 'BANZAI',
+          SendingTime: '00000000-00:00:00'
+        })
+        await writer.write(logon)
+        dispatch(send(logon))
+        writer.releaseLock()
+        reader = readable.getReader()
+        let msg;
+        while (!(msg = await reader.read()).done)
+          dispatch(recv(msg.value))
+      } catch (e) {
+        if (!signal.aborted)
+          console.error('Socket error', e)
+      } finally {
+        dispatch(disconnect())
+        reader?.releaseLock()
+        await socket.close()
+      }
+    }
+
+    if (!areDirectSocketsAvailable || state.connection.status !== 'connecting') return
+    const { host, port } = state.connection
+    const abort = new AbortController()
+    const socket = socketRef.current = new TCPSocket(host, port, { noDelay: true })
+    readLoop(socket, abort.signal)
+    return () => abort.abort()
+  }, [areDirectSocketsAvailable && state.connection.status.startsWith('connect')])
 
   return (
     <>
-      <div>
-        <a href="https://vitejs.dev" target="_blank">
-          <img src={viteLogo} className="logo" alt="Vite logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
-      </div>
-      <h1>Vite + React</h1>
-      <div className="card">
-        <button onClick={() => setCount((count) => count + 1)}>
-          count is {count}
-        </button>
-        <p>
-          Edit <code>src/App.tsx</code> and save to test HMR
-        </p>
-      </div>
-      <p className="read-the-docs">
-        TCPSocket is {typeof TCPSocket === 'function' ? (
+      <p>
+        TCPSocket is {areDirectSocketsAvailable ? (
           <span style={{ color: 'green' }}>available</span>
         ) : (
           <span style={{ color: 'red' }}>unavailable</span>
@@ -408,31 +330,48 @@ function App() {
       </p>
       <pre
         style={{ textAlign: 'left' }}
-      // title={JSON.stringify(state, (_, v) => v instanceof Map ? Object.fromEntries(v) : v, 2)}
       >
-        {/* {JSON.stringify(state, (_, v) =>
-          v instanceof Map ? Object.fromEntries(v) :
-            v instanceof Uint8Array ? new TextDecoder().decode(v.subarray(0, -1)).replace(/\x01/g, '|') :
-              v, 2)} */}
         <ol>
-          {state.completeMsgs.map((m, i) => (
-            <li key={i}>{DECODER.decode(m.subarray(0, -1)).split('\x01').map(s => s.split('=', 2)).map(([k, v]) => (
-              <Fragment key={k}>
-                <span className={css.pair} title={k === '8' ? `BeginString: ${v}` : k === '9' ? `BodyLength: ${v}` : undefined}>{k}={v}</span>
-                |
-              </Fragment>
-            ))}</li>
-            // <li key={`${m.timing.waiting}|${m.checksum}`}>8={m.version}|9={m.length}|{[...m.fields].map(([k, v]) => `${k}=${v}`).join('|')}|10={m.checksum}</li>
-          ))}
+          {state.completeMsgs.map(({ way, content: m }, i) => {
+            const pairs = DECODER.decode(m.subarray(0, -1)).split('\x01').map(s => s.split('=', 2))
+            const def = defs[pairs[0][1] as FixSupportedVersions]
+            const cch = m.subarray(0, -7).reduce((sum, v) => sum + v, 0) % 256
+
+            return (
+              <li key={i}>[{way}] {pairs.map(([k, v]) => (
+                <Fragment key={k}>
+                  <span className={css.pair} title={def?.fieldsById.has(+k) ? `${def.fieldsById.get(+k)?.name}: ${v}` : undefined}>{k}={v}</span>
+                  |
+                </Fragment>
+              ))}<ol>{pairs.map(([k, v]) => (
+                <li key={k}>
+                  <span style={def?.fieldsById.has(+k) ? undefined : { color: 'red' }}>
+                    {def?.fieldsById.has(+k) ? def.fieldsById.get(+k)?.name : k}
+                  </span>: {
+                    def.fieldsById.get(+k)?.values.get(v)?.description || v
+                  }{+k === 10 && (
+                    +v === cch ? ` ✔` : ` ✘ (expected: ${v}, actual: ${cch})`
+                  )}
+                </li>
+              ))}</ol></li>
+            )
+          })}
         </ol>
       </pre>
-      <form action="#" onSubmit={e => (e.preventDefault(), dispatch({
-        action: 'recv',
-        buffer: new TextEncoder().encode(((e.target as HTMLFormElement).elements.item(0)! as HTMLInputElement).value.replace(/\|/g, '\x01'))
-      }))}>
+      <form action="#" onSubmit={e => (e.preventDefault(), dispatch(recv(
+        new TextEncoder().encode(((e.target as HTMLFormElement).elements.item(0)! as HTMLInputElement).value.replace(/\|/g, '\x01'))
+      )))}>
         <input type="text" name="content" defaultValue="8=FIX.4.2|9=178|35=8|49=PHLX|56=PERS|52=20071123-05:30:00.000|11=ATOMNOCCC9990900|20=3|150=E|39=E|55=MSFT|167=CS|54=1|38=15|40=2|44=15|58=PHLX EQUITY TESTING|59=0|47=C|32=0|31=0|151=15|14=0|6=0|10=128|8=FIX.4.2|9=65|35=A|49=SERVER|56=CLIENT|34=177|52=20090107-18:15:16|98=0|108=30|10=062|" />
         <button type="submit">Send</button>
       </form>
+      {areDirectSocketsAvailable && (
+        <button onClick={() => dispatch(connect(
+          'localhost',
+          9878,
+          'BANZAI',
+          'EXEC'
+        ))}>Send</button>
+      )}
     </>
   )
 }
