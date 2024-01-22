@@ -13,9 +13,15 @@ interface OutgoingMsg {
   content: Uint8Array
 }
 
-type Msg =
+interface ConnectionEvent {
+  way: 'event'
+  connection: ConnectionStatus
+}
+
+type Event =
   | IncomingMsg
   | OutgoingMsg
+  | ConnectionEvent
 
 type ConnectionStatus =
   // | { status: 'offline', host: '', port: 0 }
@@ -31,7 +37,7 @@ type ProcessingMsg =
   | { status: 'complete', content: Uint8Array }
 
 interface State {
-  completeMsgs: Msg[]
+  completeMsgs: Event[]
   nextMsg: ProcessingMsg
   connection: ConnectionStatus
 }
@@ -49,33 +55,48 @@ const connect = (
   port: number,
   senderCompId: string,
   targetCompId: string
-) => (state: State): typeof state => ({
-  ...state,
-  connection: {
+) => (state: State): typeof state => {
+  if (state.connection.status === 'connecting') return state
+  const connection = {
     status: 'connecting',
     host,
     port,
     senderCompId,
     targetCompId
-  }
-})
+  } as const
+  return ({
+    ...state,
+    completeMsgs: [...state.completeMsgs, { way: 'event', connection }],
+    connection
+  })
+}
 
-const connected = () => (state: State): typeof state => ({
-  ...state,
-  connection: {
+const connected = () => (state: State): typeof state => {
+  if (state.connection.status === 'connected') return state
+  const connection = {
     ...state.connection,
     status: 'connected'
-  }
-})
+  } as const
+  return ({
+    ...state,
+    completeMsgs: [...state.completeMsgs, { way: 'event', connection }],
+    connection
+  })
+}
 
-const disconnect = (error?: string) => (state: State): typeof state => ({
-  ...state,
-  connection: {
+const disconnect = (error?: string) => (state: State): typeof state => {
+  if (state.connection.status === 'disconnected') return state
+  const connection = {
     ...state.connection,
     status: 'disconnected',
     error: error ?? null
-  }
-})
+  } as const
+  return ({
+    ...state,
+    completeMsgs: [...state.completeMsgs, { way: 'event', connection }],
+    connection
+  })
+}
 
 const send = (content: Uint8Array) => (state: State): typeof state => ({
   ...state,
@@ -302,6 +323,7 @@ function App() {
         while (!(msg = await reader.read()).done)
           dispatch(recv(msg.value))
       } catch (e) {
+        dispatch(disconnect(e instanceof Error ? e.message : String(e)))
         if (!signal.aborted)
           console.error('Socket error', e)
       } finally {
@@ -332,7 +354,26 @@ function App() {
         style={{ textAlign: 'left' }}
       >
         <ol>
-          {state.completeMsgs.map(({ way, content: m }, i) => {
+          {state.completeMsgs.map((e, i) => {
+            if (e.way === 'event') {
+              let msg;
+              switch (e.connection.status) {
+                case 'connecting':
+                  msg = `Connecting to ${e.connection.host}:${e.connection.port}...`
+                  break
+                case 'connected':
+                  msg = 'Connected'
+                  break
+                case 'disconnected':
+                  msg = `Disconnected${e.connection.error ? `: ${e.connection.error}` : ''}`
+                  break
+              }
+              return (
+                <li key={i}>{msg}</li>
+              )
+            }
+
+            const { way, content: m } = e
             const pairs = DECODER.decode(m.subarray(0, -1)).split('\x01').map(s => s.split('=', 2))
             const def = defs[pairs[0][1] as FixSupportedVersions]
             const cch = m.subarray(0, -7).reduce((sum, v) => sum + v, 0) % 256
@@ -365,12 +406,16 @@ function App() {
         <button type="submit">Send</button>
       </form>
       {areDirectSocketsAvailable && (
-        <button onClick={() => dispatch(connect(
-          'localhost',
-          9878,
-          'BANZAI',
-          'EXEC'
-        ))}>Send</button>
+        <>
+          <input type="text" id="host" placeholder="Hostname" defaultValue="localhost" />
+          <input type="number" id="port" placeholder="Port" defaultValue="9878" />
+          <button onClick={() => dispatch(connect(
+            (document.getElementById('host') as HTMLInputElement | null)?.value || 'localhost',
+            (document.getElementById('port') as HTMLInputElement | null)?.valueAsNumber || 9878,
+            'BANZAI',
+            'EXEC'
+          ))}>Connect</button>
+        </>
       )}
     </>
   )
