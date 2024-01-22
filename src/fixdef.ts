@@ -13,15 +13,15 @@ interface FixGroupMappingDefinition {
   entries: Map<string, FixEntryMappingDefinition>
 }
 
-type FixEntryMappingDefinition =
+export type FixEntryMappingDefinition =
   | FixFieldMappingDefinition
   | FixGroupMappingDefinition
 
-interface FixGroupDefinition {
+export interface FixGroupDefinition {
   entries: Map<string, FixEntryMappingDefinition>
 }
 
-interface FixMessageDefinition extends FixGroupDefinition {
+export interface FixMessageDefinition extends FixGroupDefinition {
   category: 'admin' | 'app'
   name: string
   msgType: string
@@ -147,7 +147,7 @@ const parseFieldValueElement = (root: Element, fields: Map<string, FixFieldValue
     fields.set(enum_, { enum: enum_, description })
 }
 
-const isTypeValid = (type: string | null): type is FixFieldType => !!(type && Object.prototype.hasOwnProperty.call(TYPES_VALIDATORS, type))
+const isTypeValid = (type: string | null): type is FixFieldType => !!type
 
 const parseFieldElement = (root: Element, fieldsById: Map<number, FixFieldDefinition>, fieldsByName: Map<string, FixFieldDefinition>) => {
   const id = Number(root.getAttribute('number') || '-')

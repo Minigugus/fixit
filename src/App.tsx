@@ -1,7 +1,8 @@
 import { Fragment, useEffect, useRef, useState } from 'react'
+import { HeadersByVersion, MessagesByVersion } from './defs/all'
 import css from './fix.module.css'
-import { FixDefinition, FixFieldType, FixSupportedVersions, useFixDefinitions } from './fixdef'
-import { DefinitionsByBeginString } from './defs/FIX42'
+import { FixDefinition, FixSupportedVersions, useFixDefinitions } from './fixdef'
+import { generateAll } from './fixdef2ts'
 
 interface IncomingMsg {
   way: 'recv'
@@ -26,7 +27,7 @@ type Event =
 type ConnectionStatus =
   // | { status: 'offline', host: '', port: 0 }
   | { status: 'disconnected', host: string, port: number, senderCompId: string, targetCompId: string, error: string | null }
-  | { status: 'connecting', host: string, port: number, senderCompId: string, targetCompId: string }
+  | { status: 'connecting', host: string, port: number, senderCompId: string, targetCompId: string, seqnum: number }
   | { status: 'connected', host: string, port: number, senderCompId: string, targetCompId: string }
 // | { status: 'error', host: string, port: number, error: string }
 
@@ -54,7 +55,8 @@ const connect = (
   host: string,
   port: number,
   senderCompId: string,
-  targetCompId: string
+  targetCompId: string,
+  seqnum: number
 ) => (state: State): typeof state => {
   if (state.connection.status === 'connecting') return state
   const connection = {
@@ -62,7 +64,8 @@ const connect = (
     host,
     port,
     senderCompId,
-    targetCompId
+    targetCompId,
+    seqnum
   } as const
   return ({
     ...state,
@@ -201,11 +204,31 @@ const recv = (buf: Uint8Array) => (state: State): typeof state => {
   }
 }
 
+interface Session {
+  host: string
+  port: number
+  beginString: FixSupportedVersions
+  senderCompId: string
+  targetCompId: string
+  nextSeqNum: number
+}
+
+const now = () => new Date().toISOString().replace(/[-Z]/g, '').replace(/T/g, '-')
 const formatMsg = <K extends FixSupportedVersions>(
   defs: Record<FixSupportedVersions, FixDefinition>,
-  raw: DefinitionsByBeginString & { BeginString: K, MsgType: string }
+  sess: Session & { beginString: K },
+  raw: MessagesByVersion[K] & { MsgType: string }
 ) => {
-  const { ...content } = raw
+  const content: HeadersByVersion[FixSupportedVersions] = {
+    ...raw,
+    BeginString: sess.beginString,
+    BodyLength: 0,
+    MsgType: raw.MsgType as any, // FIXME
+    MsgSeqNum: sess.nextSeqNum++,
+    SenderCompID: sess.senderCompId,
+    TargetCompID: sess.targetCompId,
+    SendingTime: now(),
+  }
   const { BeginString, MsgType } = content
   const def = defs[BeginString]
   let msg: string[] = []
@@ -242,7 +265,7 @@ const formatMsg = <K extends FixSupportedVersions>(
     }
   msg.shift()
   msg.shift()
-  msg.unshift(`9=${msg.reduce((sum, v) => sum + v.length, 7)}\x01`)
+  msg.unshift(`9=${msg.reduce((sum, v) => sum + v.length, 0)}\x01`)
   msg.unshift(`8=${def.beginString}\x01`)
   msg.push(`10=${String(msg.flatMap(v => [...v]).reduce((sum, v) => sum + v.charCodeAt(0), 0) % 256).padStart(3, '0')}\x01`)
   return new TextEncoder().encode(msg.join(''))
@@ -259,41 +282,7 @@ function App() {
 
   useEffect(() => {
     // if (areDirectSocketsAvailable) return
-    console.log(`${Object
-      .values(defs)
-      .map((v) => `export namespace FIX${v.major}${v.minor} {
-    export interface Header {
-      ${[...v.header.entries.values()]
-          .map(f => `${f.name}${f.required ? '' : '?'}: ${f.name === 'BeginString'
-            ? `'${v.beginString}'`
-            : v.fieldsByName.get(f.name)?.values.size
-              ? [...v.fieldsByName.get(f.name)?.values.values() || []].map(v => `'${v.enum}'`).join(' | ')
-              : (['FLOAT', 'INT', 'PRICE', 'PRICEOFFSET', 'QTY'] as FixFieldType[]).includes(v.fieldsByName.get(f.name)?.type as any)
-                ? 'number'
-                : 'string'}`)
-          .join('\n    ')}
-  }
-  
-  ${[...v.messages.values()]
-          .map(m => `  export interface ${m.name}Message extends Header {
-      MsgType: '${m.msgType}'
-      ${[...m.entries.values()]
-              .map(f => `${f.name}${f.required ? '' : '?'}: ${v.fieldsByName.get(f.name)?.values.size
-                ? [...v.fieldsByName.get(f.name)?.values.values() || []].map(v => `'${v.enum}'`).join(' | ')
-                : (['FLOAT', 'INT', 'PRICE', 'PRICEOFFSET', 'QTY'] as FixFieldType[]).includes(v.fieldsByName.get(f.name)?.type as any)
-                  ? 'number'
-                  : 'string'}`)
-              .join('\n    ')}
-    }`)
-          .join('\n\n')}
-  
-    export type Messages = ${[...v.messages.values()].map(m => `\n    | ${m.name}Message`).join('')}
-  
-  }`)
-      .join('\n\n')}
-  
-  export type DefinitionsByBeginString = ${Object.values(defs).map(d => `\n | FIX${d.major}${d.minor}.Messages`).join('')}
-  `)
+    console.log(generateAll(Object.values(defs)))
   }, [defs])
 
   useEffect(() => {
@@ -301,27 +290,43 @@ function App() {
       let reader;
       try {
         debugger
+        const sess = {
+          beginString: 'FIX.4.4',
+          host: host,
+          port: port,
+          nextSeqNum: seqnum,
+          senderCompId: 'BANZAI',
+          targetCompId: 'EXEC'
+        } satisfies Session
         const { readable, writable } = await socket.opened
         dispatch(connected())
-        const writer = writable.getWriter()
-        const logon = formatMsg(defs, {
-          BeginString: 'FIX.4.2',
-          BodyLength: 0,
+        let writer = writable.getWriter()
+        const logon = formatMsg(defs, sess, {
           MsgType: 'A',
-          EncryptMethod: '0',
-          HeartBtInt: 30,
-          MsgSeqNum: 0,
-          SenderCompID: 'RECV',
-          TargetCompID: 'BANZAI',
-          SendingTime: '00000000-00:00:00'
+          EncryptMethod: 0,
+          HeartBtInt: 30
         })
         await writer.write(logon)
         dispatch(send(logon))
         writer.releaseLock()
         reader = readable.getReader()
         let msg;
-        while (!(msg = await reader.read()).done)
+        while (!(msg = await reader.read()).done) {
           dispatch(recv(msg.value))
+          const decoded = DECODER.decode(msg.value.subarray(0, -1))
+          const [, value] = /\x0135=([^\x01]+)\x01/.exec(decoded) || []
+          switch (value) {
+            case '0': // Heartbeat
+              writer = writable.getWriter()
+              const hb = formatMsg(defs, sess, {
+                MsgType: '0'
+              })
+              await writer.write(hb)
+              dispatch(send(hb))
+              writer.releaseLock()
+              break
+          }
+        }
       } catch (e) {
         dispatch(disconnect(e instanceof Error ? e.message : String(e)))
         if (!signal.aborted)
@@ -335,6 +340,7 @@ function App() {
 
     if (!areDirectSocketsAvailable || state.connection.status !== 'connecting') return
     const { host, port } = state.connection
+    let { seqnum } = state.connection
     const abort = new AbortController()
     const socket = socketRef.current = new TCPSocket(host, port, { noDelay: true })
     readLoop(socket, abort.signal)
@@ -409,11 +415,15 @@ function App() {
         <>
           <input type="text" id="host" placeholder="Hostname" defaultValue="localhost" />
           <input type="number" id="port" placeholder="Port" defaultValue="9878" />
+          <input type="number" id="seqnum" placeholder="Seqnum" defaultValue="1" />
+          <input type="text" id="sender" placeholder="SenderCompID" />
+          <input type="text" id="target" placeholder="TargetCompID" />
           <button onClick={() => dispatch(connect(
             (document.getElementById('host') as HTMLInputElement | null)?.value || 'localhost',
             (document.getElementById('port') as HTMLInputElement | null)?.valueAsNumber || 9878,
-            'BANZAI',
-            'EXEC'
+            (document.getElementById('sender') as HTMLInputElement | null)?.value || 'BANZAI',
+            (document.getElementById('target') as HTMLInputElement | null)?.value || 'EXEC',
+            (document.getElementById('seqnum') as HTMLInputElement | null)?.valueAsNumber || 0
           ))}>Connect</button>
         </>
       )}
